@@ -1,0 +1,18 @@
+name: Gerar EXE leve
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Fazer o EXE
+        run: dotnet publish JMCompetitiveOptimizer.csproj -c Release -r win-x64 --self-contained false -p:DebugType=None -p:DebugSymbols=false -o publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JM-Competitive-Optimizer-leve
+          path: publish
