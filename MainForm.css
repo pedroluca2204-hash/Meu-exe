@@ -1,0 +1,639 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+using Microsoft.Win32;
+
+namespace JMCompetitiveOptimizer;
+
+public sealed class MainForm : Form
+{
+    private readonly Color bg = Color.FromArgb(13, 17, 25);
+    private readonly Color panel = Color.FromArgb(23, 30, 42);
+    private readonly Color blue = Color.FromArgb(50, 155, 255);
+    private readonly Label cpuValue = new();
+    private readonly Label ramValue = new();
+    private readonly Label diskValue = new();
+    private readonly Label gpuValue = new();
+    private readonly Label info = new();
+    private readonly TextBox logBox = new();
+    private readonly List<Button> actionButtons = new();
+    private readonly System.Windows.Forms.Timer timer = new() { Interval = 1200 };
+    private readonly DateTime started = DateTime.Now;
+    private ulong previousIdle, previousKernel, previousUser;
+
+    private const string HighPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+    private const string UltimateGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+    private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string BackupKey = @"Software\JMCompetitiveOptimizer\StartupDisabled";
+    private static readonly Regex GuidRegex = new(@"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+
+    private static readonly HashSet<string> SystemNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "explorer", "svchost", "csrss", "winlogon", "dwm", "lsass", "services", "smss", "wininit",
+        "system", "idle", "registry", "memory compression", "secure system", "msmpeng", "nissrv",
+        "securityhealthservice", "securityhealthsystray", "searchhost", "searchapp", "searchindexer",
+        "shellexperiencehost", "startmenuexperiencehost", "textinputhost", "ctfmon", "fontdrvhost",
+        "runtimebroker", "sihost", "taskhostw", "audiodg", "spoolsv", "conhost", "wmiprvse", "dllhost",
+        "applicationframehost", "systemsettings", "wudfhost", "lockapp", "mpdefendercoreservice",
+        "jm competitive optimizer"
+    };
+
+    private sealed record ProcInfo(int Pid, string Name, double Mb, string Title);
+
+    private sealed class StartupItem
+    {
+        public string Name = "";
+        public string Command = "";
+        public bool Enabled;
+    }
+
+    public MainForm()
+    {
+        Text = "JM COMPETITIVE OPTIMIZER";
+        StartPosition = FormStartPosition.CenterScreen;
+        ClientSize = new Size(1050, 690);
+        MinimumSize = new Size(900, 620);
+        BackColor = bg;
+        ForeColor = Color.White;
+        Font = new Font("Segoe UI", 9.5f);
+        BuildUi();
+        Log("Pronto. Use os botões à esquerda para otimizar o computador.");
+        timer.Tick += (_, _) => RefreshStats();
+        timer.Start();
+        RefreshStats();
+    }
+
+    private void BuildUi()
+    {
+        var sidebar = new Panel { Dock = DockStyle.Left, Width = 220, BackColor = panel };
+        Controls.Add(sidebar);
+        sidebar.Controls.Add(new Label {
+            Text = "JM COMPETITIVE\nOPTIMIZER",
+            Font = new Font("Segoe UI", 17, FontStyle.Bold),
+            ForeColor = blue, AutoSize = false, Location = new Point(22, 28),
+            Size = new Size(185, 70)
+        });
+
+        AddAction(sidebar, "Otimizar tudo", 115, OptimizeAllAsync, true);
+        AddAction(sidebar, "Fechar programas pesados", 167, CloseHeavyAsync, false);
+        AddAction(sidebar, "Modo desempenho (jogos)", 219, HighPerformanceAsync, false);
+        AddAction(sidebar, "Restaurar plano anterior", 271, RestorePowerAsync, false);
+        AddAction(sidebar, "Limpar temporários", 323, CleanTempAsync, false);
+        AddAction(sidebar, "Programas de início", 375, StartupAsync, false);
+
+        sidebar.Controls.Add(new Label {
+            Text = "VERSÃO 3.1  •  BETA", ForeColor = Color.Gray,
+            Location = new Point(22, 625), AutoSize = true
+        });
+
+        Controls.Add(new Label {
+            Text = "Visão geral do sistema", Font = new Font("Segoe UI", 23, FontStyle.Bold),
+            ForeColor = Color.White, Location = new Point(255, 28), AutoSize = true
+        });
+        info.Text = "Coletando informações do Windows...";
+        info.ForeColor = Color.Silver;
+        info.Location = new Point(258, 72);
+        info.AutoSize = true;
+        Controls.Add(info);
+
+        AddMetric("PROCESSADOR", cpuValue, 255, 110);
+        AddMetric("MEMÓRIA RAM", ramValue, 630, 110);
+        AddMetric("ARMAZENAMENTO", diskValue, 255, 235);
+        AddMetric("PLACA DE VÍDEO", gpuValue, 630, 235);
+
+        var logCard = MakeCard(255, 365, 725, 240);
+        Controls.Add(logCard);
+        logCard.Controls.Add(new Label {
+            Text = "Registro de otimização", Font = new Font("Segoe UI", 14, FontStyle.Bold),
+            ForeColor = blue, Location = new Point(20, 14), AutoSize = true
+        });
+        logBox.Multiline = true;
+        logBox.ReadOnly = true;
+        logBox.ScrollBars = ScrollBars.Vertical;
+        logBox.BackColor = Color.FromArgb(13, 17, 25);
+        logBox.ForeColor = Color.Gainsboro;
+        logBox.BorderStyle = BorderStyle.None;
+        logBox.Location = new Point(20, 52);
+        logBox.Size = new Size(685, 170);
+        logCard.Controls.Add(logBox);
+
+        Controls.Add(new Label {
+            Text = "Nada é alterado sem você clicar. Fechar programas e inicialização sempre pedem sua confirmação.",
+            ForeColor = Color.Gray, Location = new Point(258, 625), AutoSize = true
+        });
+    }
+
+    private Button AddAction(Panel parent, string text, int y, Func<Task> action, bool accent)
+    {
+        var b = new Button
+        {
+            Text = text, Location = new Point(14, y), Size = new Size(192, 44),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = accent ? blue : Color.FromArgb(35, 55, 78),
+            ForeColor = Color.White,
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(8, 0, 0, 0),
+            Cursor = Cursors.Hand
+        };
+        b.FlatAppearance.BorderSize = 0;
+        b.Click += async (_, _) => await RunBusy(action);
+        parent.Controls.Add(b);
+        actionButtons.Add(b);
+        return b;
+    }
+
+    private async Task RunBusy(Func<Task> action)
+    {
+        foreach (var b in actionButtons) b.Enabled = false;
+        try { await action(); }
+        catch (Exception ex) { Log("Erro: " + ex.Message); }
+        finally { foreach (var b in actionButtons) b.Enabled = true; }
+    }
+
+    private void AddMetric(string title, Label value, int x, int y)
+    {
+        var card = MakeCard(x, y, 350, 110);
+        Controls.Add(card);
+        card.Controls.Add(new Label {
+            Text = title, ForeColor = Color.Silver, Font = new Font("Segoe UI", 9, FontStyle.Bold),
+            Location = new Point(18, 14), AutoSize = true
+        });
+        value.Text = "--";
+        value.ForeColor = Color.White;
+        value.Font = new Font("Segoe UI", 22, FontStyle.Bold);
+        value.Location = new Point(18, 42);
+        value.Size = new Size(320, 50);
+        card.Controls.Add(value);
+    }
+
+    private Panel MakeCard(int x, int y, int w, int h) =>
+        new() { Location = new Point(x, y), Size = new Size(w, h), BackColor = panel, BorderStyle = BorderStyle.FixedSingle };
+
+    private void Log(string message)
+    {
+        logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}\r\n");
+    }
+
+    // ---------- Botões ----------
+
+    private async Task OptimizeAllAsync()
+    {
+        Log("=== Otimização completa iniciada ===");
+        await HighPerformanceAsync();
+        await CleanTempAsync();
+        await CloseHeavyAsync();
+        await StartupAsync();
+        Log("=== Otimização concluída ===");
+    }
+
+    private async Task HighPerformanceAsync()
+    {
+        Log(await Task.Run(() => ApplyHighPerformance()));
+        Log(await Task.Run(() => ApplyGameMode()));
+    }
+
+    private async Task RestorePowerAsync()
+    {
+        Log(await Task.Run(() => RestorePowerPlan()));
+    }
+
+    private async Task CleanTempAsync()
+    {
+        Log("Limpando arquivos temporários com mais de 1 dia...");
+        var (bytes, files) = await Task.Run(() => CleanTemp());
+        Log($"Limpeza concluída: {files} arquivos removidos, {bytes / 1048576.0:0.0} MB liberados.");
+    }
+
+    private async Task CloseHeavyAsync()
+    {
+        Log("Procurando programas que usam muita memória (acima de 150 MB)...");
+        var procs = await Task.Run(() => GetHeavyProcesses());
+        if (procs.Count == 0)
+        {
+            Log("Nenhum programa pesado encontrado.");
+            return;
+        }
+        var texts = procs.Select(p => $"{p.Mb:0} MB   •   {p.Name}" +
+            (string.IsNullOrWhiteSpace(p.Title) ? "" : "   —   " + p.Title)).ToList();
+        var sel = ShowChecklist("Fechar programas pesados",
+            "Marque os programas que você quer fechar. SALVE SEU TRABALHO ANTES. Nada vem marcado.",
+            texts, texts.Select(_ => false).ToList(), "Fechar marcados");
+        if (sel is null || sel.Count == 0)
+        {
+            Log("Nenhum programa foi fechado.");
+            return;
+        }
+        var chosen = sel.Select(ix => procs[ix]).ToList();
+        var result = await Task.Run(() => ClosePrograms(chosen));
+        Log($"{result.closed} programa(s) fechado(s), cerca de {result.mb:0} MB liberados.");
+        foreach (var n in result.failed)
+            Log($"Não fechou: {n} (talvez esteja pedindo para salvar algo).");
+    }
+
+    private async Task StartupAsync()
+    {
+        var items = await Task.Run(() => ReadStartup());
+        if (items.Count == 0)
+        {
+            Log("Nenhum programa de inicialização do seu usuário foi encontrado.");
+            return;
+        }
+        var texts = items.Select(x => $"{x.Name}   —   {x.Command}").ToList();
+        var sel = ShowChecklist("Programas de inicialização",
+            "Marcado = abre junto com o Windows. Desmarque os que você quer impedir. Dá para voltar aqui e marcar de novo quando quiser.",
+            texts, items.Select(x => x.Enabled).ToList(), "Aplicar");
+        if (sel is null)
+        {
+            Log("Inicialização: nada foi alterado.");
+            return;
+        }
+        int off = 0, on = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            bool want = sel.Contains(i);
+            if (want != items[i].Enabled)
+            {
+                SetStartupEnabled(items[i], want);
+                if (want) on++; else off++;
+            }
+        }
+        Log($"Inicialização: {off} desativado(s), {on} reativado(s).");
+    }
+
+    // ---------- Janela com lista ----------
+
+    private List<int>? ShowChecklist(string title, string message, List<string> items, List<bool> initial, string okText)
+    {
+        using var dlg = new Form
+        {
+            Text = title,
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(640, 520),
+            BackColor = bg,
+            ForeColor = Color.White,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false
+        };
+        dlg.Font = Font;
+        var msg = new Label { Text = message, Location = new Point(16, 14), Size = new Size(608, 52), ForeColor = Color.Silver };
+        var list = new CheckedListBox
+        {
+            Location = new Point(16, 74), Size = new Size(608, 370),
+            BackColor = panel, ForeColor = Color.White, BorderStyle = BorderStyle.None,
+            CheckOnClick = true, HorizontalScrollbar = true
+        };
+        for (int i = 0; i < items.Count; i++) list.Items.Add(items[i], initial[i]);
+        var ok = MakeDialogButton(okText, 16, DialogResult.OK, true);
+        var cancel = MakeDialogButton("Cancelar", 324, DialogResult.Cancel, false);
+        dlg.Controls.AddRange(new Control[] { msg, list, ok, cancel });
+        dlg.AcceptButton = ok;
+        dlg.CancelButton = cancel;
+        if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+        return list.CheckedIndices.Cast<int>().ToList();
+    }
+
+    private Button MakeDialogButton(string text, int x, DialogResult result, bool accent)
+    {
+        var b = new Button
+        {
+            Text = text, DialogResult = result, Location = new Point(x, 462), Size = new Size(300, 42),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = accent ? blue : Color.FromArgb(35, 55, 78),
+            ForeColor = Color.White, Cursor = Cursors.Hand
+        };
+        b.FlatAppearance.BorderSize = 0;
+        return b;
+    }
+
+    // ---------- Plano de energia e Modo de Jogo ----------
+
+    private static string RunCmd(string file, string args)
+    {
+        var psi = new ProcessStartInfo(file, args)
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true
+        };
+        using var p = Process.Start(psi);
+        if (p is null) return "";
+        string output = p.StandardOutput.ReadToEnd();
+        p.WaitForExit(10000);
+        return output;
+    }
+
+    private static string DataDir
+    {
+        get
+        {
+            string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "JMCompetitiveOptimizer");
+            Directory.CreateDirectory(d);
+            return d;
+        }
+    }
+
+    private static string? ActiveScheme()
+    {
+        var m = GuidRegex.Match(RunCmd("powercfg", "/getactivescheme"));
+        return m.Success ? m.Value.ToLowerInvariant() : null;
+    }
+
+    private static string ApplyHighPerformance()
+    {
+        try
+        {
+            string? current = ActiveScheme();
+            if (current is null) return "Não consegui ler o plano de energia atual.";
+            string optimizedFile = Path.Combine(DataDir, "plano_otimizado.txt");
+            string previousFile = Path.Combine(DataDir, "plano_anterior.txt");
+            string? ours = null;
+            if (File.Exists(optimizedFile))
+            {
+                var om = GuidRegex.Match(File.ReadAllText(optimizedFile));
+                if (om.Success) ours = om.Value.ToLowerInvariant();
+            }
+            if (current == HighPerfGuid || current == UltimateGuid || current == ours)
+                return "O plano de energia já está em Alto desempenho.";
+
+            string target = HighPerfGuid;
+            string list = RunCmd("powercfg", "/list").ToLowerInvariant();
+            if (!list.Contains(HighPerfGuid))
+            {
+                if (ours != null && list.Contains(ours))
+                {
+                    target = ours;
+                }
+                else
+                {
+                    var dup = GuidRegex.Match(RunCmd("powercfg", $"-duplicatescheme {HighPerfGuid}"));
+                    if (!dup.Success) return "Este PC não permite criar o plano Alto desempenho.";
+                    target = dup.Value.ToLowerInvariant();
+                }
+            }
+            File.WriteAllText(previousFile, current);
+            RunCmd("powercfg", $"/setactive {target}");
+            if (ActiveScheme() == target)
+            {
+                File.WriteAllText(optimizedFile, target);
+                return "Plano de energia Alto desempenho ativado. (O botão 'Restaurar plano anterior' desfaz.)";
+            }
+            return "Não consegui trocar o plano de energia.";
+        }
+        catch (Exception ex) { return "Erro no plano de energia: " + ex.Message; }
+    }
+
+    private static string RestorePowerPlan()
+    {
+        try
+        {
+            string previousFile = Path.Combine(DataDir, "plano_anterior.txt");
+            if (!File.Exists(previousFile)) return "Não há plano de energia anterior salvo.";
+            var m = GuidRegex.Match(File.ReadAllText(previousFile));
+            if (!m.Success) return "O plano anterior salvo está inválido.";
+            string prev = m.Value.ToLowerInvariant();
+            RunCmd("powercfg", $"/setactive {prev}");
+            return ActiveScheme() == prev
+                ? "Plano de energia anterior restaurado."
+                : "Não consegui restaurar o plano anterior.";
+        }
+        catch (Exception ex) { return "Erro ao restaurar o plano: " + ex.Message; }
+    }
+
+    private static string ApplyGameMode()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\GameBar");
+            if (k is null) return "Não foi possível ativar o Modo de Jogo.";
+            k.SetValue("AllowAutoGameMode", 1, RegistryValueKind.DWord);
+            k.SetValue("AutoGameModeEnabled", 1, RegistryValueKind.DWord);
+            return "Modo de Jogo do Windows ativado.";
+        }
+        catch (Exception ex) { return "Não foi possível ativar o Modo de Jogo: " + ex.Message; }
+    }
+
+    // ---------- Arquivos temporários ----------
+
+    private static (long bytes, int files) CleanTemp()
+    {
+        long bytes = 0;
+        int files = 0;
+        var limit = DateTime.Now.AddDays(-1);
+        CleanDir(new DirectoryInfo(Path.GetTempPath()), limit, ref bytes, ref files);
+        return (bytes, files);
+    }
+
+    private static void CleanDir(DirectoryInfo dir, DateTime limit, ref long bytes, ref int files)
+    {
+        FileSystemInfo[] items;
+        try { items = dir.GetFileSystemInfos(); }
+        catch { return; }
+        foreach (var item in items)
+        {
+            try
+            {
+                if ((item.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                if (item is DirectoryInfo sub)
+                {
+                    bool oldDir = sub.LastWriteTime < limit;
+                    CleanDir(sub, limit, ref bytes, ref files);
+                    if (oldDir && !sub.EnumerateFileSystemInfos().Any()) sub.Delete();
+                }
+                else if (item is FileInfo f && f.LastWriteTime < limit)
+                {
+                    long len = f.Length;
+                    f.Delete();
+                    bytes += len;
+                    files++;
+                }
+            }
+            catch { }
+        }
+    }
+
+    // ---------- Programas pesados ----------
+
+    private static List<ProcInfo> GetHeavyProcesses()
+    {
+        var list = new List<ProcInfo>();
+        int mySession = Process.GetCurrentProcess().SessionId;
+        int myPid = Environment.ProcessId;
+        foreach (var p in Process.GetProcesses())
+        {
+            try
+            {
+                if (p.Id == myPid || p.Id <= 4) continue;
+                if (p.SessionId != mySession) continue;
+                if (SystemNames.Contains(p.ProcessName)) continue;
+                double mb = p.WorkingSet64 / 1048576.0;
+                if (mb < 150) continue;
+                list.Add(new ProcInfo(p.Id, p.ProcessName, mb, p.MainWindowTitle));
+            }
+            catch { }
+            finally { p.Dispose(); }
+        }
+        return list.OrderByDescending(x => x.Mb).Take(25).ToList();
+    }
+
+    private static (int closed, double mb, List<string> failed) ClosePrograms(List<ProcInfo> list)
+    {
+        int closed = 0;
+        double mb = 0;
+        var failed = new List<string>();
+        foreach (var item in list)
+        {
+            try
+            {
+                using var p = Process.GetProcessById(item.Pid);
+                if (p.MainWindowHandle != IntPtr.Zero)
+                {
+                    p.CloseMainWindow();
+                    if (!p.WaitForExit(5000))
+                    {
+                        failed.Add(item.Name);
+                        continue;
+                    }
+                }
+                else
+                {
+                    p.Kill();
+                    p.WaitForExit(3000);
+                }
+                closed++;
+                mb += item.Mb;
+            }
+            catch { failed.Add(item.Name); }
+        }
+        return (closed, mb, failed);
+    }
+
+    // ---------- Inicialização ----------
+
+    private static List<StartupItem> ReadStartup()
+    {
+        var items = new List<StartupItem>();
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+            {
+                if (k != null)
+                {
+                    foreach (var n in k.GetValueNames())
+                    {
+                        if (n.Length == 0) continue;
+                        string cmd = k.GetValue(n, "", RegistryValueOptions.DoNotExpandEnvironmentNames)?.ToString() ?? "";
+                        items.Add(new StartupItem { Name = n, Command = cmd, Enabled = true });
+                    }
+                }
+            }
+            using (var k = Registry.CurrentUser.OpenSubKey(BackupKey))
+            {
+                if (k != null)
+                {
+                    foreach (var n in k.GetValueNames())
+                    {
+                        if (n.Length == 0) continue;
+                        string cmd = k.GetValue(n, "", RegistryValueOptions.DoNotExpandEnvironmentNames)?.ToString() ?? "";
+                        items.Add(new StartupItem { Name = n, Command = cmd, Enabled = false });
+                    }
+                }
+            }
+        }
+        catch { }
+        return items.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static void SetStartupEnabled(StartupItem item, bool enable)
+    {
+        try
+        {
+            using var run = Registry.CurrentUser.CreateSubKey(RunKey);
+            using var bak = Registry.CurrentUser.CreateSubKey(BackupKey);
+            if (run is null || bak is null) return;
+            var kind = item.Command.Contains('%') ? RegistryValueKind.ExpandString : RegistryValueKind.String;
+            if (enable)
+            {
+                run.SetValue(item.Name, item.Command, kind);
+                bak.DeleteValue(item.Name, false);
+            }
+            else
+            {
+                bak.SetValue(item.Name, item.Command, kind);
+                run.DeleteValue(item.Name, false);
+            }
+        }
+        catch { }
+    }
+
+    // ---------- Monitor ----------
+
+    private void RefreshStats()
+    {
+        try
+        {
+            if (GetSystemTimes(out var idle, out var kernel, out var user))
+            {
+                ulong i = ToUInt64(idle), k = ToUInt64(kernel), u = ToUInt64(user);
+                if (previousKernel != 0)
+                {
+                    ulong total = (k - previousKernel) + (u - previousUser);
+                    ulong busy = total > (i - previousIdle) ? total - (i - previousIdle) : 0;
+                    double pct = total == 0 ? 0 : busy * 100.0 / total;
+                    cpuValue.Text = $"{Math.Clamp(pct, 0, 100):0}% de uso";
+                }
+                previousIdle = i; previousKernel = k; previousUser = u;
+            }
+        }
+        catch { cpuValue.Text = "Indisponível"; }
+
+        try
+        {
+            MEMORYSTATUSEX mem = new() { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+            if (GlobalMemoryStatusEx(ref mem))
+            {
+                double total = mem.ullTotalPhys / 1073741824.0;
+                double used = (mem.ullTotalPhys - mem.ullAvailPhys) / 1073741824.0;
+                ramValue.Text = $"{used:0.0} / {total:0.0} GB";
+            }
+        }
+        catch { ramValue.Text = "Indisponível"; }
+
+        try
+        {
+            var drive = DriveInfo.GetDrives().FirstOrDefault(d => d.IsReady && d.Name.StartsWith(Path.GetPathRoot(Environment.SystemDirectory)!, StringComparison.OrdinalIgnoreCase));
+            diskValue.Text = drive is null ? "Não detectado" : $"{drive.AvailableFreeSpace / 1073741824.0:0} GB livres";
+        }
+        catch { diskValue.Text = "Indisponível"; }
+
+        gpuValue.Text = "Leitura não disponível";
+        info.Text = $"Windows {Environment.OSVersion.Version}  •  {RuntimeInformation.OSArchitecture}  •  aberto há {(DateTime.Now - started):hh\\:mm\\:ss}  •  atualização automática";
+    }
+
+    private static ulong ToUInt64(FILETIME t) => ((ulong)t.dwHighDateTime << 32) | t.dwLowDateTime;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemTimes(out FILETIME lpIdleTime, out FILETIME lpKernelTime, out FILETIME lpUserTime);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct MEMORYSTATUSEX
+    {
+        public uint dwLength, dwMemoryLoad;
+        public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        timer.Stop();
+        timer.Dispose();
+        base.OnFormClosed(e);
+    }
+}
